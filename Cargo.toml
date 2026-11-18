@@ -1,0 +1,19 @@
+[package]
+name = "claude-reaper"
+version = "0.1.0"
+edition = "2024"
+description = "Stops idle Claude Desktop session workers; the app resumes them on the next message"
+license = "MIT"
+repository = "https://github.com/Migiht/claude-reaper"
+readme = "README.md"
+keywords = ["claude", "memory", "daemon"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
