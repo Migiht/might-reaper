@@ -1,12 +1,12 @@
 [package]
-name = "claude-reaper"
+name = "might-reaper"
 version = "0.1.0"
 edition = "2024"
-description = "Stops idle Claude Desktop session workers; the app resumes them on the next message"
+description = "Stops idle Claude Desktop workers, Gradle/Kotlin daemons and Plasma Discover to free memory"
 license = "MIT"
-repository = "https://github.com/Migiht/claude-reaper"
+repository = "https://github.com/Migiht/might-reaper"
 readme = "README.md"
-keywords = ["claude", "memory", "daemon"]
+keywords = ["claude", "gradle", "memory", "daemon"]
 categories = ["command-line-utilities"]
 
 [dependencies]

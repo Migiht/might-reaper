@@ -1,23 +1,29 @@
-//! claude-reaper — stops idle Claude Desktop session workers.
+//! might-reaper — stops idle memory hogs: Claude Desktop session workers, Gradle and Kotlin
+//! compile daemons, and Plasma Discover.
 //!
-//! Usage: claude-reaper [--interval DUR] [--idle DUR] [--sample DUR] [--cpu PCT] [--grace DUR]
-//!                      [--only SUBSTR] [--dry-run] [--list]
+//! Usage: might-reaper [--interval DUR] [--idle DUR] [--daemon-idle DUR] [--sample DUR] [--cpu PCT]
+//!                     [--grace DUR] [--only SUBSTR] [--dry-run] [--list]
 //!
-//! Claude Desktop keeps one `claude` CLI process (a Bun binary, 100–400 MB private memory) alive for
-//! every session it has opened, until the session is archived or the app quits. Stopping the
-//! process loses nothing: the transcript is on disk and the app starts a new worker with `--resume`
-//! as soon as the session gets its next message.
+//! Targets, and why stopping them loses nothing:
+//! - Claude Desktop keeps one `claude` CLI process (a Bun binary, 100–400 MB private memory) alive
+//!   for every session it has opened. The transcript is on disk and the app starts a new worker with
+//!   `--resume` as soon as the session gets its next message.
+//! - Gradle daemons (`-Xmx4g` each) and the Kotlin compile daemon they spawn stay up for hours after
+//!   a build; the next build starts new ones.
+//! - Plasma Discover keeps a gigabyte or more after its window is closed or forgotten.
 //!
-//! The daemon samples every worker each `--sample` (5m). A sample counts as ACTIVITY when the
-//! worker used more than `--cpu` percent (1%) of one core since the previous sample — an idle
-//! worker sits at ~0.4% (Bun's GC and timers) — or when it has a child process started more than
-//! `--grace` (120s) after itself: a Bash tool call or a background task. Children started with the
-//! worker are its MCP servers and do not count. Every `--interval` (1h) the workers with no
-//! activity for `--idle` (default: the interval) get SIGTERM.
+//! The daemon samples every target each `--sample` (5m). A sample counts as ACTIVITY when the
+//! process used more than `--cpu` percent (1%) of one core since the previous sample. A Claude
+//! worker is also active while it has a child started more than `--grace` (120s) after itself: a
+//! Bash tool call or a background task (children started with the worker are its MCP servers).
+//!
+//! Claude workers are checked every `--interval` (1h) and stopped after `--idle` (default: the
+//! interval) without activity. The other targets are checked at every sample and stopped after
+//! `--daemon-idle` (15m). Stopping means SIGTERM.
 //!
 //! Only desktop workers are touched (`claude --output-format stream-json --input-format …`);
-//! interactive `claude` sessions in a terminal are left alone. Newly seen workers start as active,
-//! so a restarted daemon never kills anything before a full idle period has passed.
+//! interactive `claude` sessions in a terminal are left alone. Newly seen processes start as
+//! active, so a restarted daemon never stops anything before a full idle period has passed.
 
 use std::collections::HashMap;
 use std::fs;
@@ -33,12 +39,13 @@ unsafe extern "C" {
 }
 
 fn log(msg: &str) {
-    eprintln!("[claude-reaper] {msg}");
+    eprintln!("[might-reaper] {msg}");
 }
 
 struct Opts {
     interval: Duration,
     idle: Duration,
+    daemon_idle: Duration,
     sample: Duration,
     cpu_pct: f64,
     grace: Duration,
@@ -61,9 +68,9 @@ fn parse_duration(s: &str) -> Option<Duration> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: claude-reaper [--interval DUR] [--idle DUR] [--sample DUR] [--cpu PCT] [--grace DUR] \
-         [--only SUBSTR] [--dry-run] [--list]\n  DUR: 90, 30s, 5m, 1h, 1d\n  defaults: --interval 1h --idle <interval> \
-         --sample 5m --cpu 1 --grace 120s"
+        "usage: might-reaper [--interval DUR] [--idle DUR] [--daemon-idle DUR] [--sample DUR] [--cpu PCT] \
+         [--grace DUR] [--only SUBSTR] [--dry-run] [--list]\n  DUR: 90, 30s, 5m, 1h, 1d\n  defaults: \
+         --interval 1h --idle <interval> --daemon-idle 15m --sample 5m --cpu 1 --grace 120s"
     );
     std::process::exit(2);
 }
@@ -72,6 +79,7 @@ fn parse_args() -> Opts {
     let mut o = Opts {
         interval: Duration::from_secs(3600),
         idle: Duration::ZERO,
+        daemon_idle: Duration::from_secs(900),
         sample: Duration::from_secs(300),
         cpu_pct: 1.0,
         grace: Duration::from_secs(120),
@@ -85,6 +93,7 @@ fn parse_args() -> Opts {
         match a.as_str() {
             "--interval" => o.interval = dur(),
             "--idle" => o.idle = dur(),
+            "--daemon-idle" => o.daemon_idle = dur(),
             "--sample" => o.sample = dur(),
             "--grace" => o.grace = dur(),
             "--cpu" => {
@@ -99,8 +108,27 @@ fn parse_args() -> Opts {
     if o.idle.is_zero() {
         o.idle = o.interval;
     }
-    o.sample = o.sample.min(o.interval);
+    o.sample = o.sample.min(o.interval).min(o.daemon_idle);
     o
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Claude,
+    Gradle,
+    Kotlin,
+    Discover,
+}
+
+impl Kind {
+    fn tag(self) -> &'static str {
+        match self {
+            Kind::Claude => "claude",
+            Kind::Gradle => "gradle",
+            Kind::Kotlin => "kotlin",
+            Kind::Discover => "discover",
+        }
+    }
 }
 
 /// The fields of /proc/<pid>/stat we need.
@@ -126,27 +154,49 @@ fn pids() -> Vec<i32> {
     dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok()).collect()
 }
 
-fn is_desktop_worker(pid: i32) -> bool {
-    if fs::read_to_string(format!("/proc/{pid}/comm")).map(|c| c.trim_end() != "claude").unwrap_or(true) {
-        return false;
+fn classify(comm: &str, args: &[&[u8]]) -> Option<Kind> {
+    match comm {
+        "claude" => (args.windows(2).any(|w| w[0] == b"--output-format" && w[1] == b"stream-json")
+            && args.contains(&&b"--input-format"[..]))
+        .then_some(Kind::Claude),
+        "java" => args.iter().find_map(|a| match *a {
+            b"org.gradle.launcher.daemon.bootstrap.GradleDaemon" => Some(Kind::Gradle),
+            b"org.jetbrains.kotlin.daemon.KotlinCompileDaemon" => Some(Kind::Kotlin),
+            _ => None,
+        }),
+        // comm is cut to 15 bytes, which "plasma-discover" fills exactly.
+        "plasma-discover" => Some(Kind::Discover),
+        _ => None,
     }
-    let Ok(cmd) = fs::read(format!("/proc/{pid}/cmdline")) else { return false };
-    let args: Vec<&[u8]> = cmd.split(|&b| b == 0).collect();
-    args.windows(2).any(|w| w[0] == b"--output-format" && w[1] == b"stream-json")
-        && args.contains(&&b"--input-format"[..])
 }
 
-fn session_name(pid: i32) -> String {
-    fs::read(format!("/proc/{pid}/environ"))
-        .ok()
-        .and_then(|env| {
-            env.split(|&b| b == 0)
-                .find_map(|kv| kv.strip_prefix(b"CLAUDE_CODE_SESSION_NAME=").map(|v| String::from_utf8_lossy(v).into_owned()))
-        })
-        .unwrap_or_default()
+fn kind_of(pid: i32) -> Option<Kind> {
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let comm = comm.trim_end();
+    if !matches!(comm, "claude" | "java" | "plasma-discover") {
+        return None;
+    }
+    let cmd = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    classify(comm, &cmd.split(|&b| b == 0).collect::<Vec<_>>())
 }
 
-/// Private memory plus swap, in MiB: what stopping the worker gives back.
+fn label(kind: Kind, pid: i32) -> String {
+    match kind {
+        Kind::Claude => fs::read(format!("/proc/{pid}/environ"))
+            .ok()
+            .and_then(|env| {
+                env.split(|&b| b == 0).find_map(|kv| {
+                    kv.strip_prefix(b"CLAUDE_CODE_SESSION_NAME=").map(|v| String::from_utf8_lossy(v).into_owned())
+                })
+            })
+            .unwrap_or_default(),
+        Kind::Gradle => "Gradle daemon".into(),
+        Kind::Kotlin => "Kotlin compile daemon".into(),
+        Kind::Discover => "Plasma Discover".into(),
+    }
+}
+
+/// Private memory plus swap, in MiB: what stopping the process gives back.
 fn private_mib(pid: i32) -> u64 {
     let Ok(s) = fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) else { return 0 };
     s.lines()
@@ -157,34 +207,30 @@ fn private_mib(pid: i32) -> u64 {
 }
 
 struct Snapshot {
-    /// pid -> stat for every desktop worker.
-    workers: HashMap<i32, Stat>,
-    /// pid -> number of children started more than the grace period after it.
+    /// pid -> (kind, stat) for every target.
+    targets: HashMap<i32, (Kind, Stat)>,
+    /// Claude worker pid -> number of children started more than the grace period after it.
     late_children: HashMap<i32, usize>,
 }
 
 fn snapshot(grace_ticks: u64) -> Snapshot {
     let mut stats: HashMap<i32, Stat> = pids().into_iter().filter_map(|p| Some((p, read_stat(p)?))).collect();
-    let workers: HashMap<i32, Stat> = stats
-        .keys()
-        .copied()
-        .filter(|&p| is_desktop_worker(p))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .filter_map(|p| Some((p, stats.remove(&p)?)))
-        .collect();
+    let kinds: Vec<(i32, Kind)> = stats.keys().filter_map(|&p| Some((p, kind_of(p)?))).collect();
+    let targets: HashMap<i32, (Kind, Stat)> =
+        kinds.into_iter().filter_map(|(p, k)| Some((p, (k, stats.remove(&p)?)))).collect();
     let mut late_children = HashMap::new();
     for st in stats.values() {
-        if let Some(w) = workers.get(&st.ppid)
+        if let Some((Kind::Claude, w)) = targets.get(&st.ppid)
             && st.start_ticks.saturating_sub(w.start_ticks) > grace_ticks
         {
             *late_children.entry(st.ppid).or_insert(0) += 1;
         }
     }
-    Snapshot { workers, late_children }
+    Snapshot { targets, late_children }
 }
 
 struct Tracked {
+    kind: Kind,
     cpu_ticks: u64,
     sampled: Instant,
     last_active: Instant,
@@ -206,19 +252,24 @@ fn list(hz: u64, grace_ticks: u64) {
     let before = snapshot(grace_ticks);
     thread::sleep(wait);
     let after = snapshot(grace_ticks);
-    let mut pids: Vec<_> = after.workers.keys().copied().collect();
+    let mut pids: Vec<_> = after.targets.keys().copied().collect();
     pids.sort();
-    println!("{:>7} {:>8} {:>6} {:>5}  session", "pid", "private", "cpu%", "kids");
+    println!("{:>7} {:<8} {:>8} {:>6} {:>5}  name", "pid", "kind", "private", "cpu%", "kids");
     for pid in pids {
-        let st = &after.workers[&pid];
-        let cpu = match before.workers.get(&pid) {
-            Some(b) if b.start_ticks == st.start_ticks => {
+        let (kind, st) = &after.targets[&pid];
+        let cpu = match before.targets.get(&pid) {
+            Some((_, b)) if b.start_ticks == st.start_ticks => {
                 format!("{:.1}", (st.cpu_ticks - b.cpu_ticks) as f64 / hz as f64 / wait.as_secs_f64() * 100.0)
             }
             _ => "-".into(),
         };
         let kids = after.late_children.get(&pid).copied().unwrap_or(0);
-        println!("{pid:>7} {:>6}Mi {cpu:>6} {kids:>5}  {}", private_mib(pid), session_name(pid));
+        println!(
+            "{pid:>7} {:<8} {:>6}Mi {cpu:>6} {kids:>5}  {}",
+            kind.tag(),
+            private_mib(pid),
+            label(*kind, pid)
+        );
     }
 }
 
@@ -233,23 +284,26 @@ fn main() {
         return list(hz, grace_ticks);
     }
     log(&format!(
-        "check every {}, stop after {} idle (sample {}, cpu > {}% or a Bash child counts as activity){}",
+        "claude: check every {}, stop after {} idle; gradle/kotlin/discover: stop after {} idle \
+         (sample {}, cpu > {}% or a Bash child counts as activity){}",
         fmt_dur(o.interval),
         fmt_dur(o.idle),
+        fmt_dur(o.daemon_idle),
         fmt_dur(o.sample),
         o.cpu_pct,
         if o.dry_run { ", dry run" } else { "" }
     ));
 
-    // Keyed by (pid, start time) so a recycled pid is a new worker.
+    // Keyed by (pid, start time) so a recycled pid is a new process.
     let mut tracked: HashMap<(i32, u64), Tracked> = HashMap::new();
-    let mut next_check = Instant::now() + o.interval;
+    let mut next_claude_check = Instant::now() + o.interval;
     loop {
         let now = Instant::now();
         let snap = snapshot(grace_ticks);
-        tracked.retain(|(pid, start), _| snap.workers.get(pid).is_some_and(|s| s.start_ticks == *start));
-        for (&pid, st) in &snap.workers {
+        tracked.retain(|(pid, start), _| snap.targets.get(pid).is_some_and(|(_, s)| s.start_ticks == *start));
+        for (&pid, (kind, st)) in &snap.targets {
             let t = tracked.entry((pid, st.start_ticks)).or_insert(Tracked {
+                kind: *kind,
                 cpu_ticks: st.cpu_ticks,
                 sampled: now,
                 last_active: now,
@@ -263,38 +317,45 @@ fn main() {
             t.sampled = now;
         }
 
-        if now >= next_check {
-            next_check = now + o.interval;
-            let mut freed = 0;
-            for ((pid, start), t) in &tracked {
-                let idle = now.duration_since(t.last_active);
-                if idle < o.idle {
-                    continue;
-                }
-                // Re-check identity right before the signal: the pid may have been recycled.
-                if !read_stat(*pid).is_some_and(|s| s.start_ticks == *start) {
-                    continue;
-                }
-                let name = session_name(*pid);
-                if o.only.as_ref().is_some_and(|only| !name.contains(only.as_str())) {
-                    continue;
-                }
-                let mib = private_mib(*pid);
-                if o.dry_run || unsafe { kill(*pid, SIGTERM) } == 0 {
-                    freed += mib;
-                    log(&format!(
-                        "{}stopped pid {pid} ({mib} MiB, idle {}): {name}",
-                        if o.dry_run { "[dry run] would have " } else { "" },
-                        fmt_dur(idle)
-                    ));
-                }
+        let claude_due = now >= next_claude_check;
+        if claude_due {
+            next_claude_check = now + o.interval;
+        }
+        let mut freed = 0;
+        for ((pid, start), t) in &tracked {
+            let limit = match t.kind {
+                Kind::Claude if claude_due => o.idle,
+                Kind::Claude => continue,
+                _ => o.daemon_idle,
+            };
+            let idle = now.duration_since(t.last_active);
+            if idle < limit {
+                continue;
             }
-            if freed > 0 {
-                log(&format!("freed ~{freed} MiB"));
+            // Re-check identity right before the signal: the pid may have been recycled.
+            if !read_stat(*pid).is_some_and(|s| s.start_ticks == *start) {
+                continue;
+            }
+            let name = label(t.kind, *pid);
+            if o.only.as_ref().is_some_and(|only| !name.contains(only.as_str())) {
+                continue;
+            }
+            let mib = private_mib(*pid);
+            if o.dry_run || unsafe { kill(*pid, SIGTERM) } == 0 {
+                freed += mib;
+                log(&format!(
+                    "{}stopped {} pid {pid} ({mib} MiB, idle {}): {name}",
+                    if o.dry_run { "[dry run] would have " } else { "" },
+                    t.kind.tag(),
+                    fmt_dur(idle)
+                ));
             }
         }
+        if freed > 0 {
+            log(&format!("freed ~{freed} MiB"));
+        }
 
-        thread::sleep(o.sample.min(next_check.saturating_duration_since(Instant::now())).max(Duration::from_secs(1)));
+        thread::sleep(o.sample.min(next_claude_check.saturating_duration_since(Instant::now())).max(Duration::from_secs(1)));
     }
 }
 
@@ -316,5 +377,20 @@ mod tests {
     fn own_stat_parses() {
         let st = read_stat(std::process::id() as i32).unwrap();
         assert!(st.start_ticks > 0);
+    }
+
+    #[test]
+    fn classifies_targets() {
+        let a = |v: &[&'static str]| v.iter().map(|s| s.as_bytes()).collect::<Vec<_>>();
+        let desktop = a(&["/x/claude", "--output-format", "stream-json", "--verbose", "--input-format", "stream-json"]);
+        assert_eq!(classify("claude", &desktop), Some(Kind::Claude));
+        assert_eq!(classify("claude", &a(&["claude", "--resume"])), None);
+        let gradle = a(&["/usr/bin/java", "-Xmx4g", "-cp", "x.jar", "org.gradle.launcher.daemon.bootstrap.GradleDaemon", "8.10"]);
+        assert_eq!(classify("java", &gradle), Some(Kind::Gradle));
+        let kotlin = a(&["java", "-Xmx4g", "org.jetbrains.kotlin.daemon.KotlinCompileDaemon", "--daemon-runFilesPath", "/t"]);
+        assert_eq!(classify("java", &kotlin), Some(Kind::Kotlin));
+        assert_eq!(classify("java", &a(&["java", "-jar", "app.jar"])), None);
+        assert_eq!(classify("plasma-discover", &a(&["/usr/bin/plasma-discover"])), Some(Kind::Discover));
+        assert_eq!(classify("plasmashell", &a(&["/usr/bin/plasmashell"])), None);
     }
 }
